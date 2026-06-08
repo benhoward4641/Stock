@@ -894,6 +894,11 @@ function showView(view) {
 }
 
 // ─── CAMERA & SCANNING ───────────────────────────────────────────────────────
+let activeStream = null;
+let scanLoop = null;
+let scanCanvas = null;
+let scanCtx = null;
+
 async function startCamera(mode) {
   stopCamera();
   currentMode = mode;
@@ -902,36 +907,85 @@ async function startCamera(mode) {
   const resultId = mode === 'add' ? 'scan-result' : 'scan-result-scan';
 
   document.getElementById(offMsgId).style.display = 'none';
+  setResult(resultId, 'Starting camera…', '');
 
   try {
-    codeReader = new ZXing.BrowserMultiFormatReader();
-    const constraints = { video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } } };
-    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    // Try rear camera first, fall back to any camera
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { exact: 'environment' } }
+      });
+    } catch (e) {
+      stream = await navigator.mediaDevices.getUserMedia({ video: true });
+    }
+
+    activeStream = stream;
     const video = document.getElementById(videoId);
     video.srcObject = stream;
+
+    // Wait for video to actually be ready
+    await new Promise((res, rej) => {
+      video.onloadedmetadata = () => res();
+      video.onerror = rej;
+      setTimeout(rej, 8000); // 8s timeout
+    });
     await video.play();
 
-    codeReader.decodeFromStream(stream, video, (result, err) => {
-      if (result) handleScan(result.text, mode, resultId);
-    });
+    // Set up off-screen canvas for ZXing
+    scanCanvas = document.createElement('canvas');
+    scanCtx = scanCanvas.getContext('2d');
+
+    const hints = new Map();
+    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+    const reader = new ZXing.BrowserMultiFormatReader(hints);
+    codeReader = reader;
+
     setResult(resultId, 'Camera active — point at a barcode', '');
+
+    // Use requestAnimationFrame-based loop instead of decodeFromStream
+    function tick() {
+      if (!activeStream) return;
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        scanCanvas.width = video.videoWidth;
+        scanCanvas.height = video.videoHeight;
+        scanCtx.drawImage(video, 0, 0);
+        try {
+          const imageData = scanCtx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+          const luminanceSource = new ZXing.HTMLCanvasElementLuminanceSource(scanCanvas);
+          const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
+          const result = reader.decodeBitmap(binaryBitmap);
+          if (result) {
+            handleScan(result.getText(), mode, resultId);
+          }
+        } catch (e) {
+          // NotFoundException is normal when no barcode in frame — ignore
+        }
+      }
+      scanLoop = setTimeout(() => requestAnimationFrame(tick), 300);
+    }
+    requestAnimationFrame(tick);
+
   } catch (e) {
     document.getElementById(offMsgId).style.display = 'flex';
-    setResult(resultId, 'Camera error: ' + (e.message || e), 'error');
+    let msg = 'Camera error';
+    if (e && e.name === 'NotAllowedError') msg = 'Camera permission denied — please allow camera access in Chrome settings';
+    else if (e && e.name === 'NotFoundError') msg = 'No camera found on this device';
+    else if (e && e.message) msg = 'Camera error: ' + e.message;
+    setResult(resultId, msg, 'error');
   }
 }
 
 function stopCamera() {
-  if (codeReader) {
-    try { codeReader.reset(); } catch(e) {}
-    codeReader = null;
+  if (scanLoop) { clearTimeout(scanLoop); scanLoop = null; }
+  if (codeReader) { try { codeReader.reset(); } catch(e) {} codeReader = null; }
+  if (activeStream) {
+    activeStream.getTracks().forEach(t => t.stop());
+    activeStream = null;
   }
   ['preview','preview-scan'].forEach(id => {
     const v = document.getElementById(id);
-    if (v && v.srcObject) {
-      v.srcObject.getTracks().forEach(t => t.stop());
-      v.srcObject = null;
-    }
+    if (v) { v.srcObject = null; }
   });
   ['cam-off-add','cam-off-scan'].forEach(id => {
     const el = document.getElementById(id);
