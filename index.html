@@ -884,6 +884,7 @@ const SCAN_COOLDOWN = 2000;
 
 // ─── VIEWS ────────────────────────────────────────────────────────────────────
 function showView(view) {
+  currentMode = null; // signal any in-flight camera start to abort
   stopCamera();
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
@@ -899,7 +900,7 @@ let scanLoop = null;
 let scanCanvas = null;
 let scanCtx = null;
 
-async function startCamera(mode) {
+function startCamera(mode) {
   stopCamera();
   currentMode = mode;
   const videoId = mode === 'add' ? 'preview' : 'preview-scan';
@@ -909,71 +910,63 @@ async function startCamera(mode) {
   document.getElementById(offMsgId).style.display = 'none';
   setResult(resultId, 'Starting camera…', '');
 
-  try {
-    // Try rear camera first, fall back to any camera
-    let stream;
+  // Run everything async but never block the UI with await at top level
+  (async () => {
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { exact: 'environment' } }
-      });
-    } catch (e) {
-      stream = await navigator.mediaDevices.getUserMedia({ video: true });
-    }
-
-    activeStream = stream;
-    const video = document.getElementById(videoId);
-    video.srcObject = stream;
-
-    // Wait for video to actually be ready
-    await new Promise((res, rej) => {
-      video.onloadedmetadata = () => res();
-      video.onerror = rej;
-      setTimeout(rej, 8000); // 8s timeout
-    });
-    await video.play();
-
-    // Set up off-screen canvas for ZXing
-    scanCanvas = document.createElement('canvas');
-    scanCtx = scanCanvas.getContext('2d');
-
-    const hints = new Map();
-    hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-    const reader = new ZXing.BrowserMultiFormatReader(hints);
-    codeReader = reader;
-
-    setResult(resultId, 'Camera active — point at a barcode', '');
-
-    // Use requestAnimationFrame-based loop instead of decodeFromStream
-    function tick() {
-      if (!activeStream) return;
-      if (video.readyState === video.HAVE_ENOUGH_DATA) {
-        scanCanvas.width = video.videoWidth;
-        scanCanvas.height = video.videoHeight;
-        scanCtx.drawImage(video, 0, 0);
-        try {
-          const imageData = scanCtx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
-          const luminanceSource = new ZXing.HTMLCanvasElementLuminanceSource(scanCanvas);
-          const binaryBitmap = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminanceSource));
-          const result = reader.decodeBitmap(binaryBitmap);
-          if (result) {
-            handleScan(result.getText(), mode, resultId);
-          }
-        } catch (e) {
-          // NotFoundException is normal when no barcode in frame — ignore
-        }
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { exact: 'environment' } }
+        });
+      } catch (e) {
+        stream = await navigator.mediaDevices.getUserMedia({ video: true });
       }
-      scanLoop = setTimeout(() => requestAnimationFrame(tick), 300);
-    }
-    requestAnimationFrame(tick);
 
-  } catch (e) {
-    document.getElementById(offMsgId).style.display = 'flex';
-    let msg = 'Camera error';
-    if (e && e.name === 'NotAllowedError') msg = 'Camera permission denied — please allow camera access in Chrome settings';
-    else if (e && e.name === 'NotFoundError') msg = 'No camera found on this device';
-    else if (e && e.message) msg = 'Camera error: ' + e.message;
-    setResult(resultId, msg, 'error');
-  }
+      // Bail out if user switched tabs while camera was starting
+      if (currentMode !== mode) {
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+
+      activeStream = stream;
+      const video = document.getElementById(videoId);
+      video.srcObject = stream;
+      video.play().catch(() => {});
+
+      // Don't await play() — just poll until the video has data
+      scanCanvas = document.createElement('canvas');
+      scanCtx = scanCanvas.getContext('2d');
+      const reader = new ZXing.BrowserMultiFormatReader();
+      codeReader = reader;
+
+      setResult(resultId, 'Camera active — point at a barcode', '');
+
+      function tick() {
+        if (!activeStream || currentMode !== mode) return;
+        if (video.readyState >= 2 && video.videoWidth > 0) {
+          try {
+            scanCanvas.width = video.videoWidth;
+            scanCanvas.height = video.videoHeight;
+            scanCtx.drawImage(video, 0, 0);
+            const lum = new ZXing.HTMLCanvasElementLuminanceSource(scanCanvas);
+            const bin = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum));
+            const result = reader.decodeBitmap(bin);
+            if (result) handleScan(result.getText(), mode, resultId);
+          } catch (e) { /* no barcode in frame — normal */ }
+        }
+        scanLoop = setTimeout(tick, 350);
+      }
+      scanLoop = setTimeout(tick, 500);
+
+    } catch (e) {
+      document.getElementById(offMsgId).style.display = 'flex';
+      let msg = 'Camera error';
+      if (e && e.name === 'NotAllowedError') msg = 'Permission denied — allow camera in Chrome settings';
+      else if (e && e.name === 'NotFoundError') msg = 'No camera found';
+      else if (e && e.message) msg = 'Camera error: ' + e.message;
+      setResult(resultId, msg, 'error');
+    }
+  })();
 }
 
 function stopCamera() {
